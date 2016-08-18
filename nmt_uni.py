@@ -24,7 +24,7 @@ profile = False
 TINY    = 1e-7
 
 # -----------------------------------------------------------------------------#
-# Build the Unidirectional Attention-based Neural Machine Translation
+# Build the Attention-based Neural Machine Translation
 
 # initialize all parameters
 def init_params(options):
@@ -74,10 +74,6 @@ def init_params(options):
     return params
 
 
-
-
-
-# build a training model: uni-directional encoding
 def build_model(tparams, options):
     opt_ret   = dict()
 
@@ -120,8 +116,6 @@ def build_model(tparams, options):
     # mean of the context (across time) will be used to initialize decoder rnn
     ctx_mean    = (ctx * x_mask[:, :, None]).sum(0) / x_mask.sum(0)[:, None]
 
-    # or you can use the last state of forward + backward encoder rnns
-    # ctx_mean = concatenate([proj[0][-1], projr[0][-1]], axis=proj[0].ndim-2)
 
     # initial decoder state
     init_state  = get_layer('ff')[1](tparams, ctx_mean, options,
@@ -335,8 +329,6 @@ def build_fine(tparams, options, fullmodel=True):
 
     print 'done.'
     return f_init, f_cost, f_update
-
-
 
 
 # build a sampler for NMT
@@ -589,8 +581,12 @@ def build_simultaneous_sampler(tparams, options, trng):
 
     return f_sim_ctx, f_sim_init, f_sim_next
 
+# ---------------------------------------------------------------------------- #
+# What we need are this part = v =                                             #
+#                                                                              #
+# ---------> for reinforcement noisy decoding                                  #
+# ---------------------------------------------------------------------------- #
 
-# for reinforcement noisy decoding
 def build_noisy_sampler(tparams, options, trng):
     x = tensor.matrix('x', dtype='int64')
 
@@ -603,29 +599,23 @@ def build_noisy_sampler(tparams, options, trng):
 
     # encoder
     proj  = get_layer(options['encoder'])[1](tparams, emb, options, prefix='encoder')
-
-    # bi-rnn
     if options.get('birnn', False):
         xr    = x[::-1]
-
         embr  = tparams['Wemb'][xr.flatten()]
         embr  = embr.reshape([n_timesteps, n_samples, options['dim_word']])
         projr = get_layer(options['encoder'])[1](tparams, embr, options,
                                                  prefix='encoder_r')
-
-        ## concatenate forward and backward rnn hidden states
-        ctx = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
+        ctx   = concatenate([proj[0], projr[0][::-1]], axis=proj[0].ndim-1)
 
     else:
-        ctx  = proj[0]
+        ctx   = proj[0]
 
     # get the input for decoder rnn initializer mlp
     ctx_mean   = ctx.mean(0)
-    # ctx_mean = concatenate([proj[0][-1],projr[0][-1]], axis=proj[0].ndim-2)
     init_state = get_layer('ff')[1](tparams, ctx_mean, options,
                                     prefix='ff_state', activ='tanh')
 
-    print 'Building f_ctx/init...',
+    print 'Building Encoder: f_ctx/init...',
 
     f_sim_ctx  = theano.function([x], ctx, name = 'f_sim_ctx')
     f_sim_init = theano.function([ctx], init_state, name='f_sim_init', profile=profile)
@@ -633,8 +623,6 @@ def build_noisy_sampler(tparams, options, trng):
     print 'Done.'
 
     # -------------------------------------------------------------------------------- #
-    # -------------------------------------------------------------------------------- #
-
     y          = tensor.vector('y_sampler', dtype='int64')
     ctx        = tensor.tensor3('context_vectors', dtype='float32')
     mask       = tensor.matrix('context_mask', dtype='float32')

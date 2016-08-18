@@ -93,7 +93,7 @@ def ln(x, b, s):
 layers             = dict()
 layers['ff']       = ('param_init_fflayer', 'fflayer')
 layers['gru']      = ('param_init_gru', 'gru_layer')
-layers['gru_cond'] = ('param_init_gru_cond', 'gru_cond_layer')
+layers['gru_cond'] = ('param_init_gru_cond', 'gru_cond_layer', 'gru_cond_context', 'gru_cond_update')
 layers['lngru']    = ('param_init_lngru', 'lngru_layer')
 
 def get_layer(name):
@@ -460,7 +460,7 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
         alpha = tensor.dot(pctx__, U_att)+c_tt
         alpha = alpha.reshape([alpha.shape[0], alpha.shape[1]])
         alpha = tensor.exp(alpha)
-        
+
         if context_mask:
             alpha = alpha * context_mask
         alpha = alpha / (alpha.sum(0, keepdims=True) + TINY)
@@ -518,6 +518,157 @@ def gru_cond_layer(tparams, state_below, options, prefix='gru',
                                     profile=profile,
                                     strict=True)
     return rval
+
+# ================================================================================== #
+# Conditional GRU: depart the network
+
+def gru_cond_context(tparams, state_below, options, prefix='gru',
+                     mask=None, context=None,
+                     init_memory=None, init_state=None,
+                     context_mask=None,
+                     **kwargs):
+
+    assert context, 'Context must be provided'
+    assert init_state, 'previous state must be provided'
+
+    if state_below.ndim == 3:
+        n_samples = state_below.shape[1]
+    else:
+        n_samples = 1
+
+    # mask
+    if mask is None:
+        mask = tensor.alloc(1., state_below.shape[0], 1)
+
+    dim = tparams[_p(prefix, 'Wcx')].shape[1]
+
+    # initial/previous state
+    if init_state is None:
+        init_state = tensor.alloc(0., n_samples, dim)
+
+    # projected context
+    assert context.ndim == 3, \
+        'Context must be 3-d: #annotation x #sample x dim'
+    pctx_ = tensor.dot(context, tparams[_p(prefix, 'Wc_att')]) +\
+        tparams[_p(prefix, 'b_att')]
+
+    def _slice(_x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n*dim:(n+1)*dim]
+        return _x[:, n*dim:(n+1)*dim]
+
+    # projected x
+    state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) +\
+        tparams[_p(prefix, 'bx')]
+    state_below_ = tensor.dot(state_below, tparams[_p(prefix, 'W')]) +\
+        tparams[_p(prefix, 'b')]
+
+    def _step_slice(m_, x_, xx_, h_, pctx_, cc_,
+                    U, W_comb_att, U_att, c_tt, Ux):
+        preact1 = tensor.dot(h_, U)
+        preact1 += x_
+        preact1 = tensor.nnet.sigmoid(preact1)
+
+        r1 = _slice(preact1, 0, dim)
+        u1 = _slice(preact1, 1, dim)
+
+        preactx1 = tensor.dot(h_, Ux)
+        preactx1 *= r1
+        preactx1 += xx_
+
+        h1 = tensor.tanh(preactx1)
+
+        h1 = u1 * h_ + (1. - u1) * h1
+        h1 = m_[:, None] * h1 + (1. - m_)[:, None] * h_
+
+        # attention
+        pstate_ = tensor.dot(h1, W_comb_att)
+
+        pctx__  = pctx_ + pstate_[None, :, :]
+        pctx__  = tensor.tanh(pctx__)
+
+        alpha   = tensor.dot(pctx__, U_att)+c_tt
+        alpha   = alpha.reshape([alpha.shape[0], alpha.shape[1]])
+        alpha   = tensor.exp(alpha)
+
+        if context_mask:
+            alpha = alpha * context_mask
+        alpha = alpha / (alpha.sum(0, keepdims=True) + TINY)
+
+        ctx_ = (cc_ * alpha[:, :, None]).sum(0)  # current context
+        return h1, ctx_, alpha.T  # pstate_, preact, preactx, r, u
+
+    seqs  = [mask, state_below_, state_belowx]
+    _step = _step_slice
+
+    shared_vars = [tparams[_p(prefix, 'U')],
+                   tparams[_p(prefix, 'W_comb_att')],
+                   tparams[_p(prefix, 'U_att')],
+                   tparams[_p(prefix, 'c_tt')],
+                   tparams[_p(prefix, 'Ux')]]
+
+    rval = _step(*(seqs + [init_state, pctx_, context] + shared_vars))
+    return rval
+
+
+def gru_cond_update(tparams, options, prefix='gru',
+                   mask=None, cxt=None, h1=None,
+                   **kwargs):
+
+    assert cxt, 'Context vector must be provided'
+    assert h1,  'Temperal state vector must be provided'
+
+    # mask
+    if mask is None:
+        mask = tensor.alloc(1., h1.shape[0], 1)
+
+    dim = tparams[_p(prefix, 'Wcx')].shape[1]
+
+
+    def _slice(_x, n, dim):
+        if _x.ndim == 3:
+            return _x[:, :, n*dim:(n+1)*dim]
+        return _x[:, n*dim:(n+1)*dim]
+
+
+    def _step_slice(m_, ctx_, h1,
+                    Wc, Wcx,
+                    U_nl, Ux_nl,
+                    b_nl, bx_nl):
+
+        preact2 = tensor.dot(h1, U_nl)+b_nl
+        preact2 += tensor.dot(ctx_, Wc)
+        preact2 = tensor.nnet.sigmoid(preact2)
+
+        r2 = _slice(preact2, 0, dim)
+        u2 = _slice(preact2, 1, dim)
+
+        preactx2 = tensor.dot(h1, Ux_nl)+bx_nl
+        preactx2 *= r2
+        preactx2 += tensor.dot(ctx_, Wcx)
+
+        h2 = tensor.tanh(preactx2)
+        h2 = u2 * h1 + (1. - u2) * h2
+        h2 = m_[:, None] * h2 + (1. - m_)[:, None] * h1
+
+        return h2
+
+    seqs  = [mask, cxt, h1]
+    _step = _step_slice
+
+    shared_vars = [tparams[_p(prefix, 'Wc')],
+                   tparams[_p(prefix, 'Wcx')],
+                   tparams[_p(prefix, 'U_nl')],
+                   tparams[_p(prefix, 'Ux_nl')],
+                   tparams[_p(prefix, 'b_nl')],
+                   tparams[_p(prefix, 'bx_nl')]]
+
+    rval = _step(*(seqs + shared_vars))
+    return rval
+
+# ================================================================================== #
+
+
 
 
 # LN-GRU layer
